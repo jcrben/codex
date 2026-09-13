@@ -1427,6 +1427,92 @@ async fn sandbox_masks_multiple_denied_files() {
 }
 
 #[tokio::test]
+async fn sandbox_denied_file_count_and_rule_matrix() {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    for access in [FileSystemAccessMode::Read, FileSystemAccessMode::Write] {
+        for rule in ["exact", "glob"] {
+            for count in [0, 1, 2, 3] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let cwd = AbsolutePathBuf::try_from(temp.path()).expect("absolute workspace");
+                std::fs::create_dir(temp.path().join("nested")).expect("nested fixture directory");
+                let mut entries = vec![
+                    FileSystemSandboxEntry::new(
+                        FileSystemPath::Special {
+                            value: FileSystemSpecialPath::Root,
+                        },
+                        FileSystemAccessMode::Read,
+                    ),
+                    FileSystemSandboxEntry::new(cwd.clone().into(), access),
+                ];
+                let names = ["one.key", "nested/two.key", "nested/three.key"];
+                for name in names.iter().take(count) {
+                    let path = temp.path().join(name);
+                    std::fs::write(&path, "dummy fixture").expect("write fixture");
+                    if rule == "exact" {
+                        entries.push(FileSystemSandboxEntry::new(
+                            AbsolutePathBuf::try_from(path)
+                                .expect("absolute fixture")
+                                .into(),
+                            FileSystemAccessMode::Deny,
+                        ));
+                    }
+                }
+                if rule == "glob" {
+                    entries.push(FileSystemSandboxEntry::new(
+                        FileSystemPath::GlobPattern {
+                            pattern: format!("{}/**/*.key", temp.path().display()),
+                        },
+                        FileSystemAccessMode::Deny,
+                    ));
+                }
+                let write_check = if access == FileSystemAccessMode::Write {
+                    "printf allowed > permitted-write"
+                } else {
+                    "if (printf denied > permitted-write) 2>/dev/null; then exit 9; fi"
+                };
+                let command = format!(
+                    "set -eu; for file in one.key nested/two.key nested/three.key; do test ! -r \"$file\"; test ! -w \"$file\"; done; {write_check}; printf ok"
+                );
+                let policy = FileSystemSandboxPolicy::restricted(entries);
+                let output = run_cmd_result_with_permission_profile_for_cwd(
+                    &["sh", "-c", &command],
+                    cwd,
+                    PermissionProfile::from_runtime_permissions(
+                        &policy,
+                        NetworkSandboxPolicy::Restricted,
+                    ),
+                    create_env_from_core_vars(),
+                    LONG_TIMEOUT_MS,
+                    /*use_legacy_landlock*/ false,
+                )
+                .await
+                .expect("sandbox command");
+                assert_eq!(
+                    (output.exit_code, output.stdout.text.as_str()),
+                    (0, "ok"),
+                    "access={access:?}, rule={rule}, count={count}, stderr={}",
+                    output.stderr.text
+                );
+                for name in names.iter().take(count) {
+                    assert_eq!(
+                        std::fs::read_to_string(temp.path().join(name)).unwrap(),
+                        "dummy fixture"
+                    );
+                }
+                assert_eq!(
+                    temp.path().join("permitted-write").exists(),
+                    access == FileSystemAccessMode::Write
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn sandbox_starts_with_denied_tmp_without_exposing_registry() {
     if should_skip_bwrap_tests().await {
         eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
