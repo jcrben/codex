@@ -1319,6 +1319,60 @@ async fn sandbox_blocks_explicit_split_policy_carveouts_under_bwrap() {
 }
 
 #[tokio::test]
+async fn sandbox_masks_multiple_denied_files() {
+    if should_skip_bwrap_tests().await {
+        eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = AbsolutePathBuf::try_from(temp.path()).expect("absolute workspace");
+    let mut entries = vec![
+        FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::Root,
+            },
+            FileSystemAccessMode::Read,
+        ),
+        FileSystemSandboxEntry::new(cwd.clone().into(), FileSystemAccessMode::Write),
+    ];
+    for name in ["first.key", "second.key", "third.key"] {
+        let file = temp.path().join(name);
+        std::fs::write(&file, "private fixture").expect("write fixture");
+        entries.push(FileSystemSandboxEntry::new(
+            AbsolutePathBuf::try_from(file)
+                .expect("absolute fixture")
+                .into(),
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    let policy = FileSystemSandboxPolicy::restricted(entries);
+    let output = run_cmd_result_with_permission_profile_for_cwd(
+        &[
+            "sh", "-c",
+            "set -e; for file in first.key second.key third.key; do test ! -r \"$file\"; test ! -w \"$file\"; done; printf ok",
+        ],
+        cwd,
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Enabled),
+        create_env_from_core_vars(),
+        LONG_TIMEOUT_MS,
+        /*use_legacy_landlock*/ false,
+    ).await.expect("sandbox should start with multiple denied files");
+    assert_eq!(
+        (output.exit_code, output.stdout.text.as_str()),
+        (0, "ok"),
+        "stderr: {}",
+        output.stderr.text
+    );
+    for name in ["first.key", "second.key", "third.key"] {
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join(name)).unwrap(),
+            "private fixture"
+        );
+    }
+}
+
+#[tokio::test]
 async fn sandbox_starts_with_denied_tmp_without_exposing_registry() {
     if should_skip_bwrap_tests().await {
         eprintln!("skipping bwrap test: bwrap sandbox prerequisites are unavailable");
