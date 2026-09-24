@@ -946,10 +946,13 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
     let rollout_path = home.path().join("rollout.jsonl");
     File::create(&rollout_path)?;
     let read_only_file = std::fs::OpenOptions::new().read(true).open(&rollout_path)?;
+    let recovery_file = read_only_file.try_clone()?;
     let mut state = RolloutWriterState {
         writer: Some(JsonlWriter {
             file: tokio::fs::File::from_std(read_only_file),
+            recovery_file,
         }),
+        fallback_file: None,
         deferred_creation: false,
         pending_items: Vec::new(),
         meta: None,

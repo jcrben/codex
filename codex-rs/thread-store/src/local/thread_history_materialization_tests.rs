@@ -1838,6 +1838,145 @@ ORDER BY turns.rollout_ordinal
 }
 
 #[tokio::test]
+async fn unlink_live_rollout_recovers_history_and_projection() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await
+        .expect("persist session metadata");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started("turn-1")],
+        })
+        .await
+        .expect("append first item");
+
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    let before_unlink = fs::read(&rollout_path).expect("read rollout before unlink");
+    fs::remove_file(&rollout_path).expect("unlink live rollout");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_completed("turn-1")],
+        })
+        .await
+        .expect("append after unlink");
+
+    assert_recovered_rollout(&rollout_path, before_unlink.as_slice()).await;
+
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let rollout_len = i64::try_from(fs::metadata(&rollout_path).expect("rollout metadata").len())
+        .expect("rollout length");
+    assert_eq!(projection_state(&pool, thread_id).await, (rollout_len, 3));
+}
+
+#[tokio::test]
+async fn unlink_recovery_does_not_replace_a_concurrently_recreated_rollout() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await
+        .expect("persist session metadata");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started("turn-1")],
+        })
+        .await
+        .expect("append first item");
+
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    let before_unlink = fs::read(&rollout_path).expect("read rollout before unlink");
+    fs::remove_file(&rollout_path).expect("unlink live rollout");
+    fs::write(&rollout_path, b"external replacement\n").expect("recreate rollout path");
+    let result = store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_completed("turn-1")],
+        })
+        .await;
+    assert!(result.is_err(), "the failed recovery must reach the caller");
+    assert_eq!(
+        fs::read(&rollout_path).expect("read external replacement"),
+        b"external replacement\n",
+        "recovery must not overwrite a path created by another actor"
+    );
+
+    fs::remove_file(&rollout_path).expect("remove external replacement");
+    store
+        .flush_thread(thread_id)
+        .await
+        .expect("retry recovery after conflict is removed");
+    assert_recovered_rollout(&rollout_path, before_unlink.as_slice()).await;
+}
+
+#[tokio::test]
+async fn unlink_recovery_failure_is_reported_and_can_be_retried() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .persist_thread(thread_id, PersistContext::Standard)
+        .await
+        .expect("persist session metadata");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_started("turn-1")],
+        })
+        .await
+        .expect("append first item");
+
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    let before_unlink = fs::read(&rollout_path).expect("read rollout before unlink");
+    let rollout_dir = rollout_path.parent().expect("rollout parent").to_path_buf();
+    fs::remove_file(&rollout_path).expect("unlink live rollout");
+    fs::remove_dir(&rollout_dir).expect("remove rollout parent");
+    let result = store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![turn_completed("turn-1")],
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "the persistence failure must reach the caller"
+    );
+    assert!(
+        !rollout_path.exists(),
+        "failed recovery must not create an empty canonical rollout"
+    );
+
+    fs::create_dir_all(&rollout_dir).expect("restore rollout parent");
+    store
+        .flush_thread(thread_id)
+        .await
+        .expect("retry recovery after restoring rollout parent");
+    assert_recovered_rollout(&rollout_path, before_unlink.as_slice()).await;
+}
+
+#[tokio::test]
 async fn next_write_catches_up_unprojected_durable_suffix() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
@@ -2717,6 +2856,27 @@ WHERE thread_id = ?
     .fetch_one(pool)
     .await
     .expect("read projection state")
+}
+
+async fn assert_recovered_rollout(rollout_path: &Path, before_unlink: &[u8]) {
+    let contents = fs::read(rollout_path).expect("read recovered rollout");
+    assert!(
+        contents.starts_with(before_unlink),
+        "the complete pre-unlink JSONL prefix must survive recovery"
+    );
+    let (items, _, parse_errors) = RolloutRecorder::load_rollout_items(rollout_path)
+        .await
+        .expect("load recovered rollout");
+    assert_eq!(parse_errors, 0);
+    assert!(matches!(items.first(), Some(RolloutItem::SessionMeta(_))));
+    assert!(matches!(
+        items.get(1),
+        Some(RolloutItem::EventMsg(EventMsg::TurnStarted(event))) if event.turn_id == "turn-1"
+    ));
+    assert!(matches!(
+        items.get(2),
+        Some(RolloutItem::EventMsg(EventMsg::TurnComplete(event))) if event.turn_id == "turn-1"
+    ));
 }
 
 fn rollout_line(ordinal: Option<u64>, item: RolloutItem) -> String {

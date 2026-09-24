@@ -53,6 +53,8 @@ use super::metadata;
 use super::ordinal::RolloutOrdinalState;
 use super::ordinal::ordinal_state_for_rollout;
 use super::rollout_file_name::RolloutFileName;
+use super::rollout_recovery::recover_rollout_path;
+use super::rollout_recovery::same_file;
 use super::session_index::find_thread_names_by_ids;
 use crate::InitialHistory;
 use crate::ResumedHistory;
@@ -124,7 +126,10 @@ pub enum RolloutRecorderParams {
 }
 
 enum RolloutCmd {
-    AddItems(Vec<RolloutItem>),
+    AddItems {
+        items: Vec<RolloutItem>,
+        ack: oneshot::Sender<std::io::Result<()>>,
+    },
     Persist {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
@@ -947,6 +952,7 @@ impl RolloutRecorder {
 
                 RolloutWriterState {
                     writer: None,
+                    fallback_file: None,
                     deferred_creation: true,
                     pending_items: Vec::new(),
                     meta: Some(session_meta),
@@ -957,10 +963,14 @@ impl RolloutRecorder {
                 }
             }
             RolloutRecorderParams::Resume { path } => {
-                let (path, file, ordinal_state) =
+                let (path, file, recovery_file, ordinal_state) =
                     open_rollout_for_append(path.as_path(), writer_lock.clone()).await?;
                 RolloutWriterState {
-                    writer: Some(JsonlWriter { file }),
+                    writer: Some(JsonlWriter {
+                        file,
+                        recovery_file,
+                    }),
+                    fallback_file: None,
                     deferred_creation: false,
                     pending_items: Vec::new(),
                     meta: None,
@@ -1014,14 +1024,23 @@ impl RolloutRecorder {
         if items.is_empty() {
             return Ok(());
         }
+        let (ack, rx) = oneshot::channel();
         self.tx
-            .send(RolloutCmd::AddItems(items.to_vec()))
+            .send(RolloutCmd::AddItems {
+                items: items.to_vec(),
+                ack,
+            })
             .await
             .map_err(|e| {
                 self.writer_task.terminal_failure().unwrap_or_else(|| {
                     IoError::other(format!("failed to queue rollout items: {e}"))
                 })
+            })?;
+        rx.await.map_err(|e| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!("failed waiting for rollout item write: {e}"))
             })
+        })?
     }
 
     /// Materialize the rollout file and persist all buffered items.
@@ -1047,8 +1066,8 @@ impl RolloutRecorder {
 
     /// Flush all queued writes and wait until they are committed by the writer task.
     ///
-    /// If the first writer attempt fails, the writer drops and reopens the file handle before
-    /// retrying. This returns an error only when that retry also fails or the writer task is gone.
+    /// If the first writer attempt fails, the writer reopens the file handle before retrying.
+    /// This returns an error only when that retry also fails or the writer task is gone.
     pub async fn flush(&self) -> std::io::Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -1746,10 +1765,13 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
 /// Mutable state owned by the background rollout writer.
 ///
 /// Items are first appended to `pending_items`; persist/flush/shutdown remove each item from that
-/// queue only after it is written successfully. I/O failures drop the file handle but keep the
-/// unwritten suffix so the next barrier can reopen the file and retry.
+/// queue only after it is written successfully. I/O failures keep a readable fallback descriptor
+/// and leave the unwritten suffix queued so the next barrier can reopen the file and retry.
 struct RolloutWriterState {
     writer: Option<JsonlWriter>,
+    /// Retain a readable descriptor when reopening after a transient error. If the canonical path
+    /// disappears before the retry, this descriptor still owns the only copy of the rollout.
+    fallback_file: Option<File>,
     /// True until a newly created rollout is first materialized.
     deferred_creation: bool,
     pending_items: Vec<RolloutItem>,
@@ -1765,40 +1787,55 @@ impl RolloutWriterState {
         self.pending_items.extend(items);
     }
 
-    async fn flush_if_materialized(&mut self) {
+    async fn flush_if_materialized(&mut self) -> Result<(), WriterWriteError> {
         if self.is_deferred() {
-            return;
+            return Ok(());
         }
-        if let Err(err) = self.flush().await {
-            self.enter_recovery_mode(&err);
-        }
+        self.write_pending_with_recovery("flush").await
     }
 
     async fn persist(&mut self) -> std::io::Result<()> {
-        self.write_pending_with_recovery("persist").await
+        self.write_pending_with_recovery("persist")
+            .await
+            .map_err(Into::into)
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
-        self.write_pending_with_recovery("flush").await
+        self.write_pending_with_recovery("flush")
+            .await
+            .map_err(Into::into)
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
-        self.write_pending_with_recovery("shutdown").await
+        self.write_pending_with_recovery("shutdown")
+            .await
+            .map_err(Into::into)
     }
 
-    async fn write_pending_with_recovery(&mut self, operation: &str) -> std::io::Result<()> {
+    async fn write_pending_with_recovery(
+        &mut self,
+        operation: &str,
+    ) -> Result<(), WriterWriteError> {
         match self.write_pending_once().await {
             Ok(()) => {
                 self.last_logged_error = None;
                 Ok(())
             }
-            Err(first_err) => {
+            Err(WriterWriteError::Recovery(err)) => {
+                self.report_recovery_failure(&err);
+                Err(WriterWriteError::Recovery(err))
+            }
+            Err(WriterWriteError::Io(first_err)) => {
+                if let Err(err) = self.ensure_canonical_writer().await {
+                    self.report_recovery_failure(&err);
+                    return Err(WriterWriteError::Recovery(err));
+                }
                 self.enter_recovery_mode(&first_err);
                 warn!("failed to {operation} rollout writer; reopening and retrying: {first_err}");
                 match self.write_pending_once().await {
@@ -1806,13 +1843,21 @@ impl RolloutWriterState {
                         self.last_logged_error = None;
                         Ok(())
                     }
-                    Err(second_err) => {
+                    Err(WriterWriteError::Recovery(err)) => {
+                        self.report_recovery_failure(&err);
+                        Err(WriterWriteError::Recovery(err))
+                    }
+                    Err(WriterWriteError::Io(second_err)) => {
+                        if let Err(err) = self.ensure_canonical_writer().await {
+                            self.report_recovery_failure(&err);
+                            return Err(WriterWriteError::Recovery(err));
+                        }
                         self.enter_recovery_mode(&second_err);
                         warn!(
                             "retrying rollout writer {operation} failed; first error: \
                              {first_err}; final error: {second_err}"
                         );
-                        Err(second_err)
+                        Err(WriterWriteError::Io(second_err))
                     }
                 }
             }
@@ -1835,19 +1880,100 @@ impl RolloutWriterState {
             );
         }
         self.last_logged_error = Some(message);
-        self.writer = None;
+        if let Some(writer) = self.writer.take() {
+            self.fallback_file = Some(writer.recovery_file);
+        }
     }
 
-    async fn ensure_writer_open(&mut self) -> std::io::Result<()> {
+    fn report_recovery_failure(&mut self, err: &IoError) {
+        let message = err.to_string();
+        if self.last_logged_error.as_ref() != Some(&message) {
+            error!(
+                "failed to recover unlinked rollout {}; the open descriptor is retained and \
+                 rollout persistence has stopped: {err}",
+                self.rollout_path.display()
+            );
+        }
+        self.last_logged_error = Some(message);
+    }
+
+    async fn ensure_writer_open(&mut self) -> Result<(), WriterWriteError> {
         if self.writer.is_some() {
             return Ok(());
         }
 
+        if let Some(fallback_file) = self.fallback_file.as_ref() {
+            let source = fallback_file
+                .try_clone()
+                .map_err(WriterWriteError::Recovery)?;
+            self.restore_writer_from_source(source)
+                .await
+                .map_err(WriterWriteError::Recovery)?;
+            return Ok(());
+        }
+
         let file = open_log_file(self.rollout_path.as_path())?;
+        let recovery_file = file.try_clone()?;
         self.writer = Some(JsonlWriter {
             file: tokio::fs::File::from_std(file),
+            recovery_file,
         });
         self.deferred_creation = false;
+        Ok(())
+    }
+
+    async fn ensure_canonical_writer(&mut self) -> std::io::Result<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Ok(());
+        };
+        let writer_metadata = writer.file.metadata().await?;
+        let path_metadata = match tokio::fs::metadata(self.rollout_path.as_path()).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                self.recover_unlinked_writer().await?;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+        if same_file(&writer_metadata, &path_metadata) {
+            return Ok(());
+        }
+
+        self.recover_unlinked_writer().await
+    }
+
+    async fn recover_unlinked_writer(&mut self) -> std::io::Result<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| IoError::other("rollout writer is not open"))?;
+        writer.file.flush().await?;
+        writer.file.sync_all().await?;
+        let source = writer.recovery_file.try_clone()?;
+        self.restore_writer_from_source(source).await
+    }
+
+    async fn restore_writer_from_source(&mut self, source: File) -> std::io::Result<()> {
+        let rollout_path = self.rollout_path.clone();
+        let (file, recovery_file, recovered) = tokio::task::spawn_blocking(move || {
+            let (file, recovered) = recover_rollout_path(rollout_path.as_path(), source)?;
+            let recovery_file = file.try_clone()?;
+            Ok::<_, IoError>((file, recovery_file, recovered))
+        })
+        .await
+        .map_err(IoError::other)??;
+        self.writer = Some(JsonlWriter {
+            file: tokio::fs::File::from_std(file),
+            recovery_file,
+        });
+        self.fallback_file = None;
+        self.deferred_creation = false;
+        if recovered {
+            warn!(
+                "recovered unlinked rollout {} from its open file descriptor",
+                self.rollout_path.display()
+            );
+        }
         Ok(())
     }
 
@@ -1866,47 +1992,81 @@ impl RolloutWriterState {
         Ok(())
     }
 
-    async fn write_pending_once(&mut self) -> std::io::Result<()> {
+    async fn write_pending_once(&mut self) -> Result<(), WriterWriteError> {
         self.ensure_writer_open().await?;
+        self.ensure_canonical_writer()
+            .await
+            .map_err(WriterWriteError::Recovery)?;
         self.write_session_meta_if_needed().await?;
+        self.ensure_canonical_writer()
+            .await
+            .map_err(WriterWriteError::Recovery)?;
 
         self.write_pending_items_once().await?;
 
         if let Some(writer) = self.writer.as_mut() {
             writer.file.flush().await?;
         }
+        self.ensure_canonical_writer()
+            .await
+            .map_err(WriterWriteError::Recovery)?;
         Ok(())
     }
 
-    async fn write_pending_items_once(&mut self) -> std::io::Result<()> {
-        let Some(writer) = self.writer.as_mut() else {
-            return Err(IoError::other("rollout writer is not open"));
-        };
-
+    async fn write_pending_items_once(&mut self) -> Result<(), WriterWriteError> {
         let mut written_count = 0usize;
         let mut write_result = Ok(());
-        for item in &self.pending_items {
-            match self.ordinal_state.current() {
-                Ok(ordinal) => match writer.write_rollout_item(item, ordinal).await {
-                    Ok(()) => self.ordinal_state.advance(),
+        {
+            let Some(writer) = self.writer.as_mut() else {
+                return Err(IoError::other("rollout writer is not open").into());
+            };
+            for item in &self.pending_items {
+                match self.ordinal_state.current() {
+                    Ok(ordinal) => match writer.write_rollout_item(item, ordinal).await {
+                        Ok(()) => self.ordinal_state.advance(),
+                        Err(err) => {
+                            write_result = Err(err);
+                            break;
+                        }
+                    },
                     Err(err) => {
                         write_result = Err(err);
                         break;
                     }
-                },
-                Err(err) => {
-                    write_result = Err(err);
-                    break;
                 }
+                written_count += 1;
             }
-            written_count += 1;
         }
 
         if written_count > 0 {
+            let recovery_result = self
+                .ensure_canonical_writer()
+                .await
+                .map_err(WriterWriteError::Recovery);
             self.pending_items.drain(..written_count);
+            recovery_result?;
         }
 
-        write_result
+        write_result.map_err(WriterWriteError::Io)
+    }
+}
+
+enum WriterWriteError {
+    Io(IoError),
+    Recovery(IoError),
+}
+
+impl From<IoError> for WriterWriteError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<WriterWriteError> for IoError {
+    fn from(err: WriterWriteError) -> Self {
+        match err {
+            WriterWriteError::Io(err) | WriterWriteError::Recovery(err) => err,
+        }
     }
 }
 
@@ -1917,9 +2077,13 @@ async fn rollout_writer(
     // Process rollout commands
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            RolloutCmd::AddItems(items) => {
+            RolloutCmd::AddItems { items, ack } => {
                 state.add_items(items);
-                state.flush_if_materialized().await;
+                let result = match state.flush_if_materialized().await {
+                    Ok(()) | Err(WriterWriteError::Io(_)) => Ok(()),
+                    Err(WriterWriteError::Recovery(err)) => Err(err),
+                };
+                let _ = ack.send(result);
             }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);
@@ -1984,22 +2148,25 @@ pub async fn append_rollout_item_to_path(
     rollout_path: &Path,
     item: &RolloutItem,
 ) -> std::io::Result<()> {
-    let (_rollout_path, file, ordinal_state) =
+    let (_rollout_path, file, recovery_file, ordinal_state) =
         open_rollout_for_append(rollout_path, /*writer_lock*/ None).await?;
     let ordinal = ordinal_state.current()?;
-    let mut writer = JsonlWriter { file };
+    let mut writer = JsonlWriter {
+        file,
+        recovery_file,
+    };
     writer.write_rollout_item(item, ordinal).await
 }
 
 async fn open_rollout_for_append(
     path: &Path,
     writer_lock: Option<Arc<crate::WriterLockGuard>>,
-) -> std::io::Result<(PathBuf, tokio::fs::File, RolloutOrdinalState)> {
+) -> std::io::Result<(PathBuf, tokio::fs::File, File, RolloutOrdinalState)> {
     let refresh_modified_time =
         !tokio::fs::try_exists(compression::plain_rollout_path(path)).await?;
     let path = compression::materialize_rollout_for_append(path, writer_lock.clone()).await?;
     let path_for_open = path.clone();
-    let (file, ordinal_state) = tokio::task::spawn_blocking(move || {
+    let (file, recovery_file, ordinal_state) = tokio::task::spawn_blocking(move || {
         let _writer_lock = writer_lock;
         let mut file = File::options()
             .read(true)
@@ -2010,11 +2177,17 @@ async fn open_rollout_for_append(
         }
         ensure_rollout_is_newline_terminated(&mut file)?;
         let ordinal_state = ordinal_state_for_rollout(&mut file, path_for_open.as_path())?;
-        Ok::<_, std::io::Error>((file, ordinal_state))
+        let recovery_file = file.try_clone()?;
+        Ok::<_, std::io::Error>((file, recovery_file, ordinal_state))
     })
     .await
     .map_err(IoError::other)??;
-    Ok((path, tokio::fs::File::from_std(file), ordinal_state))
+    Ok((
+        path,
+        tokio::fs::File::from_std(file),
+        recovery_file,
+        ordinal_state,
+    ))
 }
 
 fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> {
@@ -2034,6 +2207,7 @@ fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> 
 
 struct JsonlWriter {
     file: tokio::fs::File,
+    recovery_file: File,
 }
 
 #[derive(serde::Serialize)]
