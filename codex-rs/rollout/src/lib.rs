@@ -18,6 +18,7 @@ pub(crate) mod policy;
 pub(crate) mod recorder;
 mod reverse_jsonl_scanner;
 mod rollout_file_name;
+mod rollout_recovery;
 mod rollout_reference_index;
 pub(crate) mod search;
 mod seekable_reader;
