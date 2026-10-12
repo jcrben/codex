@@ -39,8 +39,7 @@ async fn retired_model_turn_override_emits_error_without_second_request() -> Res
         sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
     )
     .await;
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let mut builder = test_codex().with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let test = builder.build_with_auto_env(&server).await?;
     test.thread_manager
         .get_models_manager()
@@ -64,7 +63,10 @@ async fn retired_model_turn_override_emits_error_without_second_request() -> Res
             text_elements: Vec::new(),
         }]))
         .await?;
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
     core_test_support::submit_thread_settings(
         &test.codex,
