@@ -1559,6 +1559,9 @@ pub(crate) async fn build_realtime_session_config(
                 RealtimeWsVersion::V3 => DEFAULT_FRAMELESS_REALTIME_MODEL.to_string(),
             }),
     );
+    if let Some(model) = model.as_deref() {
+        codex_protocol::model_policy::ensure_model_not_retired(model)?;
+    }
     let event_parser = match version {
         RealtimeWsVersion::V1 => RealtimeEventParser::V1,
         RealtimeWsVersion::V2 => RealtimeEventParser::RealtimeV2,
