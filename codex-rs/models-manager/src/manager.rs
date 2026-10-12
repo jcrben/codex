@@ -11,6 +11,7 @@ use codex_login::AuthManager;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::Result as CoreResult;
+use codex_protocol::model_policy::retired_codex_sol_model;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ModelVisibility;
@@ -169,6 +170,7 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
 
     /// Build picker-ready presets from the active catalog snapshot.
     fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
+        remote_models.retain(|model| !retired_codex_sol_model(&model.slug));
         remote_models.sort_by_key(|model| model.priority);
 
         let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
@@ -769,6 +771,13 @@ impl ModelsManager for StaticModelsManager {
                     .await;
                 let requested_model = model.as_deref();
 
+                if let Some(requested_model) = requested_model
+                    && retired_codex_sol_model(requested_model)
+                {
+                    // Preserve the selection for the inference boundary's explicit
+                    // refusal; catalog filtering must not silently remap retirement.
+                    return requested_model.to_string();
+                }
                 if allow_provider_model_fallback {
                     if requested_model_is_available(requested_model, &available_models)
                         && let Some(requested_model) = requested_model
@@ -917,6 +926,10 @@ fn construct_model_info(
     };
     model_info::with_config_overrides(model_info, config)
 }
+
+#[cfg(test)]
+#[path = "retirement_tests.rs"]
+mod retirement_tests;
 
 #[cfg(test)]
 #[path = "manager_tests.rs"]

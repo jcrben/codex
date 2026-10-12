@@ -87,6 +87,7 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
+use codex_protocol::model_policy::ensure_model_not_retired;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
@@ -673,6 +674,9 @@ impl ModelClient {
         mut extra_headers: ApiHeaderMap,
         api_provider_override: Option<ApiProvider>,
     ) -> Result<RealtimeWebrtcCallStart> {
+        if let Some(model) = session_config.model.as_deref() {
+            ensure_model_not_retired(model)?;
+        }
         // Create the media call over HTTP first, then retain matching auth so realtime can attach
         // the server-side control WebSocket to the call id from that HTTP response.
         let client_setup = self
@@ -731,6 +735,7 @@ impl ModelClient {
         effort: Option<ReasoningEffortConfig>,
         session_telemetry: &SessionTelemetry,
     ) -> Result<Vec<ApiMemorySummarizeOutput>> {
+        ensure_model_not_retired(&model_info.slug)?;
         if raw_memories.is_empty() {
             return Ok(Vec::new());
         }
@@ -892,6 +897,7 @@ impl ModelClient {
         responses_metadata: &CodexResponsesMetadata,
         include_internal: bool,
     ) -> Result<ResponsesApiRequest> {
+        ensure_model_not_retired(&model_info.slug)?;
         let mut input = prompt.get_formatted_input_for_request(model_info);
         if !self.reasoning_effort_override_enabled(model_info) {
             // Unsupported models and disabled overrides must also accept saved history.
@@ -1455,6 +1461,7 @@ impl ModelClientSession {
         session_telemetry: &SessionTelemetry,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
+        ensure_model_not_retired(&model_info.slug)?;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -1653,6 +1660,7 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        ensure_model_not_retired(&model_info.slug)?;
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
             .as_ref()
@@ -2164,6 +2172,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
+        ensure_model_not_retired(&model_info.slug)?;
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
@@ -2226,6 +2235,7 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        ensure_model_not_retired(&model_info.slug)?;
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -2936,6 +2946,10 @@ impl WebsocketTelemetry for ApiTelemetry {
             .record_websocket_event(result, duration);
     }
 }
+
+#[cfg(test)]
+#[path = "client_retirement_tests.rs"]
+mod retirement_tests;
 
 #[cfg(test)]
 #[path = "client_tests.rs"]

@@ -138,6 +138,7 @@ mod model_overrides;
 #[path = "model_provider_requirements_tests.rs"]
 mod model_provider_requirements;
 mod model_request;
+mod model_retirement;
 mod model_runtime_selectors;
 mod model_switching;
 mod model_visible_layout;
